@@ -710,6 +710,21 @@ function pushLoginStateCandidate(out, provider, rawPath, paths, options = {}) {
   }));
 }
 
+function readClaudeAuthStatus() {
+  const result = spawnSync("claude", ["auth", "status"], {
+    encoding: "utf8",
+    timeout: 5000,
+    maxBuffer: 512 * 1024,
+  });
+  if (result.error || result.status !== 0) return null;
+  try {
+    const parsed = JSON.parse(result.stdout || "{}");
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 function credentialLocalCandidates(provider) {
   const out = [];
   if (provider.provider === "codex") {
@@ -738,6 +753,21 @@ function credentialLocalCandidates(provider) {
       sourceKind: "api-key",
       note: "Claude Code 本机 Anthropic API Key",
     });
+    const authStatus = readClaudeAuthStatus();
+    if (authStatus?.loggedIn) {
+      const detail = [
+        authStatus.authMethod ? `auth=${authStatus.authMethod}` : "",
+        authStatus.apiProvider ? `provider=${authStatus.apiProvider}` : "",
+        authStatus.subscriptionType ? `plan=${authStatus.subscriptionType}` : "",
+      ].filter(Boolean).join(", ");
+      out.push(credentialLocalCandidate(provider, {
+        sourceName: "claude auth status",
+        sourceKind: "local-cli-login",
+        importable: false,
+        note: `Claude Code 本机已登录${detail ? ` (${detail})` : ""}`,
+        reason: "本机 Claude Code 登录态可被本机 CLI 使用，但不能作为 ANTHROPIC_API_KEY 上传；云端项目需在项目 Terminal/VNC 内完成 Claude Code 登录，或导入 Anthropic API Key。",
+      }));
+    }
     pushLoginStateCandidate(out, provider, "~/Library/Application Support/Claude/config.json", [
       ["oauth:tokenCache"],
     ], {

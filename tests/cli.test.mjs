@@ -1235,10 +1235,21 @@ test("credentials import --from-local dry-run detects desktop sources without le
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "anyenv-cli-local-"));
   const home = path.join(dir, "home");
   const config = path.join(dir, "config.json");
+  const binDir = path.join(dir, "bin");
   fs.mkdirSync(path.join(home, ".codex"), { recursive: true });
   fs.mkdirSync(path.join(home, "Library", "Application Support", "Claude"), { recursive: true });
   fs.mkdirSync(path.join(home, "Library", "Application Support", "Qoder", "SharedClientCache", "cache"), { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
   fs.writeFileSync(config, JSON.stringify({ accessToken: "eyJ-cli-access-token" }));
+  const fakeClaude = path.join(binDir, "claude");
+  fs.writeFileSync(fakeClaude, `#!/bin/sh
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"hidden@example.com","subscriptionType":"max"}'
+  exit 0
+fi
+exit 1
+`, "utf8");
+  fs.chmodSync(fakeClaude, 0o755);
   fs.writeFileSync(path.join(home, ".codex", "auth.json"), JSON.stringify({
     auth_mode: "chatgpt",
     OPENAI_API_KEY: {},
@@ -1262,7 +1273,7 @@ test("credentials import --from-local dry-run detects desktop sources without le
     "--from-local",
     "--dry-run",
     "--json",
-  ], credentialTestEnv({ ANYENV_CONFIG: config, HOME: home }));
+  ], credentialTestEnv({ ANYENV_CONFIG: config, HOME: home, PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}` }));
   const parsed = JSON.parse(output);
   assert.equal(parsed.dryRun, true);
   const qoder = parsed.items.find((item) => item.provider === "qoder");
@@ -1273,9 +1284,11 @@ test("credentials import --from-local dry-run detects desktop sources without le
   assert.equal(qoder.token, "qod****...oken");
   assert.ok(parsed.skipped.some((group) => group.provider === "codex" && group.sources.some((source) => /登录态不能作为 OPENAI_API_KEY/.test(source.reason))));
   assert.ok(parsed.skipped.some((group) => group.provider === "claude" && group.sources.some((source) => /不能作为 ANTHROPIC_API_KEY/.test(source.reason))));
+  assert.ok(parsed.skipped.some((group) => group.provider === "claude" && group.sources.some((source) => source.sourceKind === "local-cli-login" && /本机 Claude Code 登录态/.test(source.reason))));
   assert.doesNotMatch(output, /qoder-desktop-machine-token/);
   assert.doesNotMatch(output, /codex-desktop-access-token/);
   assert.doesNotMatch(output, /claude-desktop-oauth-cache/);
+  assert.doesNotMatch(output, /hidden@example.com/);
 });
 
 test("credentials import syncs a Qoder desktop token from local storage", async () => {

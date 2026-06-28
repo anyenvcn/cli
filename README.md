@@ -305,7 +305,7 @@ anyenv credentials import --provider cursor --from-local --yes
 anyenv credentials import --all --from-local --yes
 ```
 
-`--from-local` 会读取常见 CLI / Desktop 配置位置并只在命令确认后上传。当前会自动导入明确可用于运行环境的 API Key / CLI 访问令牌，例如 `~/.codex/auth.json` 中的 `OPENAI_API_KEY`、`~/.claude/settings.json` 中的 `ANTHROPIC_API_KEY`、Cursor Desktop 的 `cursorAuth/accessToken`、Qoder Desktop 的 `machine_token.json`。Codex ChatGPT 登录态、Claude Desktop OAuth 缓存这类网页登录态会在 `--dry-run --json` 的 `skipped` 里展示为“已发现但未导入”，不会被当作 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` 上传。
+`--from-local` 会读取常见 CLI / Desktop 配置位置并只在命令确认后上传。当前会自动导入明确可用于运行环境的 API Key / CLI 访问令牌，例如 `~/.codex/auth.json` 中的 `OPENAI_API_KEY`、`~/.claude/settings.json` 中的 `ANTHROPIC_API_KEY`、Cursor Desktop 的 `cursorAuth/accessToken`、Qoder Desktop 的 `machine_token.json`。Codex ChatGPT 登录态、Claude Code 本机登录状态、Claude Desktop OAuth 缓存这类账号登录态会在 `--dry-run --json` 的 `skipped` 里展示为“已发现但未导入”，不会被当作 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` 上传；云端项目如需使用账号登录态，应在项目 Terminal/VNC 内完成对应 CLI 官方登录，让登录态落到该项目的持久 CLI home。
 
 默认识别的环境变量:
 
