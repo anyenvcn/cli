@@ -77,8 +77,8 @@ Cloud operations (uses user access token):
   anyenv projects list [--json]
   anyenv projects create --name <name> [--workspace-id <id>] [--json]
   anyenv projects get --project <id> [--json]
-  anyenv credentials import --provider codex|claude|cursor|qwen|opencode|qoder [--token <token>|--from-env <name>|--from-file <path>] [--name <name>] [--dry-run] [--yes] [--json]
-  anyenv credentials import --all [--dry-run] [--yes] [--json]
+  anyenv credentials import --provider codex|claude|cursor|qwen|opencode|qoder [--token <token>|--from-env <name>|--from-file <path>|--from-local] [--name <name>] [--dry-run] [--yes] [--json]
+  anyenv credentials import --all [--from-local] [--dry-run] [--yes] [--json]
   anyenv coding --project <id> [--prompt <text>] [--session <id>] [--agent <id>] [--model <model>] [--json]
   anyenv deploy list|create|status|rollback|readiness --project <id> [--json]
   anyenv sandbox status|start|stop|logs --project <id> [--remove] [--tail 200] [--json]
@@ -135,7 +135,7 @@ function parseArgs(argv) {
       continue;
     }
     const key = item.slice(2);
-    if (key === "json" || key === "debug" || key === "no-save" || key === "no-open" || key === "no-register" || key === "dry-run" || key === "backup" || key === "once" || key === "read-only" || key === "allow-local-commands" || key === "allow-remote-desktop" || key === "follow") {
+    if (key === "json" || key === "debug" || key === "no-save" || key === "no-open" || key === "no-register" || key === "dry-run" || key === "backup" || key === "once" || key === "read-only" || key === "allow-local-commands" || key === "allow-remote-desktop" || key === "follow" || key === "from-local" || key === "scan-local") {
       args[key] = true;
       continue;
     }
@@ -576,6 +576,270 @@ function knownCredentialImportProviders() {
   return Object.keys(CREDENTIAL_IMPORT_PROVIDERS).join("|");
 }
 
+function credentialHomeDir() {
+  return process.env.HOME || os.homedir();
+}
+
+function expandCredentialHome(rawPath) {
+  if (!rawPath) return "";
+  if (rawPath === "~") return credentialHomeDir();
+  if (rawPath.startsWith("~/")) return path.join(credentialHomeDir(), rawPath.slice(2));
+  return rawPath;
+}
+
+function displayCredentialPath(file) {
+  const home = credentialHomeDir();
+  if (file === home) return "~";
+  if (file.startsWith(`${home}${path.sep}`)) return `~/${file.slice(home.length + 1)}`;
+  return file;
+}
+
+function readCredentialJson(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function jsonStringAt(value, pathParts) {
+  let cur = value;
+  for (const part of pathParts) {
+    if (!cur || typeof cur !== "object") return "";
+    cur = cur[part];
+  }
+  if (typeof cur === "string") return cur.trim();
+  if (typeof cur === "number" || typeof cur === "boolean") return String(cur).trim();
+  return "";
+}
+
+function firstJsonString(value, paths) {
+  for (const parts of paths) {
+    const found = jsonStringAt(value, Array.isArray(parts) ? parts : [parts]);
+    if (found) return found;
+  }
+  return "";
+}
+
+function sqlStringLiteral(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function readSqliteItemTableValue(file, key) {
+  if (!fs.existsSync(file)) return { value: "", error: "" };
+  const sql = `select value from ItemTable where key = ${sqlStringLiteral(key)} limit 1;`;
+  const result = spawnSync("sqlite3", ["-json", file, sql], {
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024,
+  });
+  if (result.error) return { value: "", error: result.error.code || result.error.message };
+  if (result.status !== 0) return { value: "", error: (result.stderr || "").trim() || `sqlite3 exited ${result.status}` };
+  try {
+    const rows = JSON.parse(result.stdout || "[]");
+    return { value: String(rows?.[0]?.value || "").trim(), error: "" };
+  } catch {
+    return { value: "", error: "sqlite parse failed" };
+  }
+}
+
+function credentialLocalCandidate(provider, options = {}) {
+  const token = String(options.token || "").trim();
+  return {
+    provider: provider.provider,
+    label: provider.label,
+    source: "local",
+    sourceName: options.sourceName || "",
+    sourceKind: options.sourceKind || "local",
+    importable: options.importable !== false && Boolean(token),
+    token,
+    aiProvider: options.aiProvider || provider.aiProvider,
+    name: options.name || provider.name,
+    note: options.note || "",
+    reason: options.reason || "",
+  };
+}
+
+function maskedCredentialLocalCandidate(candidate) {
+  return {
+    provider: candidate.provider,
+    label: candidate.label,
+    source: candidate.source,
+    sourceName: candidate.sourceName,
+    sourceKind: candidate.sourceKind,
+    importable: Boolean(candidate.importable),
+    aiProvider: candidate.aiProvider,
+    name: candidate.name,
+    token: candidate.token ? maskToken(candidate.token) : "",
+    note: candidate.note,
+    reason: candidate.reason,
+  };
+}
+
+function pushJsonTokenCandidate(out, provider, rawPath, paths, options = {}) {
+  const file = expandCredentialHome(rawPath);
+  if (!fs.existsSync(file)) return "";
+  const parsed = readCredentialJson(file);
+  if (!parsed) return "";
+  const token = firstJsonString(parsed, paths);
+  if (!token) return "";
+  out.push(credentialLocalCandidate(provider, {
+    token,
+    sourceName: `${displayCredentialPath(file)}:${options.keyLabel || paths[0].join?.(".") || paths[0]}`,
+    sourceKind: options.sourceKind || "api-key",
+    aiProvider: options.aiProvider,
+    name: options.name,
+    note: options.note,
+  }));
+  return token;
+}
+
+function pushLoginStateCandidate(out, provider, rawPath, paths, options = {}) {
+  const file = expandCredentialHome(rawPath);
+  if (!fs.existsSync(file)) return;
+  const parsed = readCredentialJson(file);
+  if (!parsed) return;
+  const token = firstJsonString(parsed, paths);
+  if (!token) return;
+  out.push(credentialLocalCandidate(provider, {
+    token,
+    sourceName: `${displayCredentialPath(file)}:${options.keyLabel || paths[0].join?.(".") || paths[0]}`,
+    sourceKind: options.sourceKind || "desktop-login",
+    importable: false,
+    note: options.note,
+    reason: options.reason || "发现的是桌面/网页登录态，不是该 agent 运行时需要的 API Key 或 CLI 访问令牌。",
+  }));
+}
+
+function credentialLocalCandidates(provider) {
+  const out = [];
+  if (provider.provider === "codex") {
+    pushJsonTokenCandidate(out, provider, "~/.codex/auth.json", [
+      ["OPENAI_API_KEY"],
+      ["env", "OPENAI_API_KEY"],
+    ], {
+      keyLabel: "OPENAI_API_KEY",
+      sourceKind: "api-key",
+      note: "Codex 本机 OpenAI API Key",
+    });
+    pushLoginStateCandidate(out, provider, "~/.codex/auth.json", [
+      ["tokens", "access_token"],
+      ["tokens", "refresh_token"],
+    ], {
+      keyLabel: "tokens",
+      note: "Codex ChatGPT 登录态",
+      reason: "Codex ChatGPT 登录态不能作为 OPENAI_API_KEY 注入到云端运行环境。",
+    });
+  } else if (provider.provider === "claude") {
+    pushJsonTokenCandidate(out, provider, "~/.claude/settings.json", [
+      ["env", "ANTHROPIC_API_KEY"],
+      ["ANTHROPIC_API_KEY"],
+    ], {
+      keyLabel: "ANTHROPIC_API_KEY",
+      sourceKind: "api-key",
+      note: "Claude Code 本机 Anthropic API Key",
+    });
+    pushLoginStateCandidate(out, provider, "~/Library/Application Support/Claude/config.json", [
+      ["oauth:tokenCache"],
+    ], {
+      keyLabel: "oauth:tokenCache",
+      note: "Claude Desktop OAuth 登录态",
+      reason: "Claude Desktop OAuth 缓存不能作为 ANTHROPIC_API_KEY 注入到云端运行环境。",
+    });
+  } else if (provider.provider === "cursor") {
+    pushJsonTokenCandidate(out, provider, "~/.cursor/cli-config.json", [
+      ["CURSOR_API_KEY"],
+      ["cursorApiKey"],
+      ["accessToken"],
+      ["access_token"],
+      ["token"],
+    ], {
+      keyLabel: "CURSOR_API_KEY/token",
+      sourceKind: "cli-token",
+      note: "Cursor CLI 本机访问令牌",
+    });
+    const sqliteFile = expandCredentialHome("~/Library/Application Support/Cursor/User/globalStorage/state.vscdb");
+    const sqliteValue = readSqliteItemTableValue(sqliteFile, "cursorAuth/accessToken");
+    if (sqliteValue.value) {
+      out.push(credentialLocalCandidate(provider, {
+        token: sqliteValue.value,
+        sourceName: `${displayCredentialPath(sqliteFile)}:cursorAuth/accessToken`,
+        sourceKind: "desktop-token",
+        note: "Cursor Desktop 登录访问令牌",
+      }));
+    } else if (sqliteValue.error) {
+      out.push(credentialLocalCandidate(provider, {
+        sourceName: `${displayCredentialPath(sqliteFile)}:cursorAuth/accessToken`,
+        sourceKind: "desktop-store",
+        importable: false,
+        reason: `无法读取 Cursor Desktop sqlite 存储: ${sqliteValue.error}`,
+      }));
+    }
+  } else if (provider.provider === "qwen") {
+    pushJsonTokenCandidate(out, provider, "~/.qwen/settings.json", [
+      ["env", "DASHSCOPE_API_KEY"],
+      ["DASHSCOPE_API_KEY"],
+      ["apiKey"],
+      ["api_key"],
+    ], {
+      keyLabel: "DASHSCOPE_API_KEY",
+      sourceKind: "api-key",
+      aiProvider: "dashscope",
+      note: "Qwen Code 本机 DashScope API Key",
+    });
+    pushJsonTokenCandidate(out, provider, "~/.qwen/config.json", [
+      ["env", "DASHSCOPE_API_KEY"],
+      ["DASHSCOPE_API_KEY"],
+      ["apiKey"],
+      ["api_key"],
+    ], {
+      keyLabel: "DASHSCOPE_API_KEY",
+      sourceKind: "api-key",
+      aiProvider: "dashscope",
+      note: "Qwen Code 本机 DashScope API Key",
+    });
+  } else if (provider.provider === "opencode") {
+    pushJsonTokenCandidate(out, provider, "~/.opencode/auth.json", [
+      ["OPENAI_API_KEY"],
+      ["env", "OPENAI_API_KEY"],
+      ["apiKey"],
+      ["api_key"],
+    ], {
+      keyLabel: "OPENAI_API_KEY",
+      sourceKind: "api-key",
+      note: "OpenCode 本机 OpenAI API Key",
+    });
+    pushJsonTokenCandidate(out, provider, "~/.opencode/config.json", [
+      ["OPENAI_API_KEY"],
+      ["env", "OPENAI_API_KEY"],
+      ["apiKey"],
+      ["api_key"],
+    ], {
+      keyLabel: "OPENAI_API_KEY",
+      sourceKind: "api-key",
+      note: "OpenCode 本机 OpenAI API Key",
+    });
+  } else if (provider.provider === "qoder") {
+    pushJsonTokenCandidate(out, provider, "~/.qoder/credentials.json", [
+      ["QODER_PERSONAL_ACCESS_TOKEN"],
+      ["personalAccessToken"],
+      ["personal_access_token"],
+      ["token"],
+    ], {
+      keyLabel: "QODER_PERSONAL_ACCESS_TOKEN/token",
+      sourceKind: "cli-token",
+      note: "Qoder CLI 本机访问令牌",
+    });
+    pushJsonTokenCandidate(out, provider, "~/Library/Application Support/Qoder/SharedClientCache/cache/machine_token.json", [
+      ["token"],
+    ], {
+      keyLabel: "token",
+      sourceKind: "desktop-token",
+      note: "Qoder Desktop machine token",
+    });
+  }
+  return out;
+}
+
 function readCredentialTokenFile(file) {
   const raw = fs.readFileSync(path.resolve(file), "utf8").trim();
   if (!raw) return "";
@@ -625,6 +889,28 @@ function credentialImportToken(args, provider) {
       sourceName: path.resolve(fromFile),
     };
   }
+  if (args["from-local"] || args.fromLocal || args["scan-local"] || args.scanLocal) {
+    const candidates = credentialLocalCandidates(provider);
+    const importable = candidates.find((candidate) => candidate.importable && candidate.token);
+    if (importable) {
+      return {
+        token: importable.token,
+        source: "local",
+        sourceName: importable.sourceName,
+        sourceKind: importable.sourceKind,
+        aiProvider: importable.aiProvider,
+        name: importable.name,
+        note: importable.note,
+        skipped: candidates.filter((candidate) => candidate !== importable).map(maskedCredentialLocalCandidate),
+      };
+    }
+    return {
+      token: "",
+      source: "local",
+      sourceName: "",
+      skipped: candidates.map(maskedCredentialLocalCandidate),
+    };
+  }
   for (const envName of provider.envVars || []) {
     const token = String(process.env[envName] || "").trim();
     if (token) return { token, source: "env", sourceName: envName };
@@ -634,11 +920,11 @@ function credentialImportToken(args, provider) {
 
 function credentialImportBody(args, provider, tokenInfo) {
   const providerFromEnv = provider.envProviderMap?.[tokenInfo.sourceName] || "";
-  const aiProvider = args["ai-provider"] || args.aiProvider || providerFromEnv || provider.aiProvider;
+  const aiProvider = args["ai-provider"] || args.aiProvider || tokenInfo.aiProvider || providerFromEnv || provider.aiProvider;
   const model = args.model || args["model-id"] || "";
   const body = {
     type: "api-key",
-    name: args.name || provider.name,
+    name: args.name || tokenInfo.name || provider.name,
     aiProvider,
     modelIds: model ? [model] : [...(provider.modelIds || [])],
     secret: tokenInfo.token,
@@ -681,10 +967,18 @@ function credentialImportPlan(args) {
   }
   const plan = [];
   const missing = [];
+  const skipped = [];
   for (const providerId of providerIds) {
     const provider = CREDENTIAL_IMPORT_PROVIDERS[providerId];
     if (!provider) throw new Error(`未知凭证导入 provider: ${providerId}。支持: ${knownCredentialImportProviders()}`);
     const tokenInfo = credentialImportToken(args, provider);
+    if (tokenInfo.skipped?.length) {
+      skipped.push({
+        provider: provider.provider,
+        label: provider.label,
+        sources: tokenInfo.skipped,
+      });
+    }
     if (!tokenInfo.token) {
       missing.push({
         provider,
@@ -698,18 +992,33 @@ function credentialImportPlan(args) {
       tokenInfo: {
         source: tokenInfo.source,
         sourceName: tokenInfo.sourceName,
+        sourceKind: tokenInfo.sourceKind || "",
         token: maskToken(tokenInfo.token),
+        note: tokenInfo.note || "",
       },
       body,
     });
   }
-  if (!plan.length) {
-    const hint = missing
-      .map((item) => `${item.provider.label}: ${item.envVars.join(" / ")}`)
-      .join("; ");
-    throw new Error(`没有发现可导入的本机凭证。请设置环境变量、使用 --token，或使用 --from-file。${hint ? ` 默认环境变量: ${hint}` : ""}`);
+  if (!plan.length && !args["dry-run"]) {
+    throw new Error(missingCredentialImportMessage(missing, skipped));
   }
-  return plan;
+  return { items: plan, missing, skipped };
+}
+
+function missingCredentialImportMessage(missing, skipped = []) {
+  const hint = missing
+    .map((item) => `${item.provider.label}: ${item.envVars.join(" / ")}`)
+    .join("; ");
+  const skippedHint = skipped
+    .flatMap((item) => item.sources || [])
+    .filter((source) => source.reason)
+    .map((source) => `${source.sourceName}: ${source.reason}`)
+    .join("; ");
+  return [
+    "没有发现可导入的本机凭证。请设置环境变量、使用 --token、--from-file，或用 --from-local 扫描本机工具配置。",
+    hint ? `默认环境变量: ${hint}` : "",
+    skippedHint ? `已发现但未导入: ${skippedHint}` : "",
+  ].filter(Boolean).join(" ");
 }
 
 async function syncCredentialImport(config, item, args, existingCredentials) {
@@ -728,7 +1037,9 @@ async function syncCredentialImport(config, item, args, existingCredentials) {
     aiProvider: item.body.aiProvider,
     source: item.tokenInfo.source,
     sourceName: item.tokenInfo.sourceName,
+    sourceKind: item.tokenInfo.sourceKind,
     token: item.tokenInfo.token,
+    note: item.tokenInfo.note,
     defaultAgentId: defaultResult ? item.provider.agentId : "",
     credential,
   };
@@ -738,7 +1049,8 @@ async function cmdCredentials(args) {
   const action = args._[1] || "list";
   if (action !== "import") throw new Error(`未知 credentials 命令: ${action}`);
   const config = resolveConfig(args);
-  const plan = credentialImportPlan(args);
+  const importPlan = credentialImportPlan(args);
+  const plan = importPlan.items;
   if (args["dry-run"]) {
     const preview = plan.map((item) => ({
       provider: item.provider.provider,
@@ -747,12 +1059,19 @@ async function cmdCredentials(args) {
       name: item.body.name,
       source: item.tokenInfo.source,
       sourceName: item.tokenInfo.sourceName,
+      sourceKind: item.tokenInfo.sourceKind,
       token: item.tokenInfo.token,
+      note: item.tokenInfo.note,
       setDefaultAgentId: args["no-default"] ? "" : item.provider.agentId,
     }));
-    if (args.json) printJson({ dryRun: true, items: preview });
+    if (args.json) printJson({ dryRun: true, items: preview, skipped: importPlan.skipped, missing: importPlan.missing.map((item) => ({ provider: item.provider.provider, label: item.provider.label, envVars: item.envVars })) });
     else for (const item of preview) {
-      process.stdout.write(`${item.label}: ${item.name} (${item.aiProvider}) from ${item.sourceName || item.source}; token ${item.token}\n`);
+      process.stdout.write(`${item.label}: ${item.name} (${item.aiProvider}) from ${item.sourceName || item.source}; token ${item.token}${item.note ? `; ${item.note}` : ""}\n`);
+    }
+    if (!args.json && importPlan.skipped.length) {
+      for (const group of importPlan.skipped) for (const source of group.sources || []) {
+        process.stdout.write(`Skipped ${group.label}: ${source.sourceName} ${source.reason || source.note || "not importable"}${source.token ? `; token ${source.token}` : ""}\n`);
+      }
     }
     return;
   }
@@ -769,7 +1088,7 @@ async function cmdCredentials(args) {
   }
   for (const item of results) {
     process.stdout.write(`${item.action === "updated" ? "Updated" : "Created"} credential: ${item.credential.name} (${item.aiProvider})\n`);
-    process.stdout.write(`Source: ${item.sourceName || item.source}; token ${item.token}\n`);
+    process.stdout.write(`Source: ${item.sourceName || item.source}; token ${item.token}${item.note ? `; ${item.note}` : ""}\n`);
     if (item.defaultAgentId) process.stdout.write(`Default agent credential: ${item.defaultAgentId}\n`);
   }
 }

@@ -59,6 +59,17 @@ function runAsyncFull(args, env = {}) {
   });
 }
 
+function credentialTestEnv(env = {}) {
+  return {
+    OPENAI_API_KEY: "",
+    ANTHROPIC_API_KEY: "",
+    DASHSCOPE_API_KEY: "",
+    CURSOR_API_KEY: "",
+    QODER_PERSONAL_ACCESS_TOKEN: "",
+    ...env,
+  };
+}
+
 function waitFor(fn, timeoutMs = 5000) {
   const started = Date.now();
   return new Promise((resolve, reject) => {
@@ -1218,6 +1229,162 @@ test("credentials import dry-run previews detected token without uploading it", 
   assert.equal(parsed.items[0].aiProvider, "qoder");
   assert.equal(parsed.items[0].setDefaultAgentId, "qoder");
   assert.doesNotMatch(output, /qoder-secret-token-value/);
+});
+
+test("credentials import --from-local dry-run detects desktop sources without leaking secrets", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "anyenv-cli-local-"));
+  const home = path.join(dir, "home");
+  const config = path.join(dir, "config.json");
+  fs.mkdirSync(path.join(home, ".codex"), { recursive: true });
+  fs.mkdirSync(path.join(home, "Library", "Application Support", "Claude"), { recursive: true });
+  fs.mkdirSync(path.join(home, "Library", "Application Support", "Qoder", "SharedClientCache", "cache"), { recursive: true });
+  fs.writeFileSync(config, JSON.stringify({ accessToken: "eyJ-cli-access-token" }));
+  fs.writeFileSync(path.join(home, ".codex", "auth.json"), JSON.stringify({
+    auth_mode: "chatgpt",
+    OPENAI_API_KEY: {},
+    tokens: {
+      access_token: "codex-desktop-access-token",
+      refresh_token: "codex-desktop-refresh-token",
+    },
+  }));
+  fs.writeFileSync(path.join(home, "Library", "Application Support", "Claude", "config.json"), JSON.stringify({
+    "oauth:tokenCache": "claude-desktop-oauth-cache",
+  }));
+  fs.writeFileSync(path.join(home, "Library", "Application Support", "Qoder", "SharedClientCache", "cache", "machine_token.json"), JSON.stringify({
+    token: "qoder-desktop-machine-token",
+    type: "machine",
+  }));
+
+  const output = run([
+    "credentials",
+    "import",
+    "--all",
+    "--from-local",
+    "--dry-run",
+    "--json",
+  ], credentialTestEnv({ ANYENV_CONFIG: config, HOME: home }));
+  const parsed = JSON.parse(output);
+  assert.equal(parsed.dryRun, true);
+  const qoder = parsed.items.find((item) => item.provider === "qoder");
+  assert.equal(qoder.aiProvider, "qoder");
+  assert.equal(qoder.source, "local");
+  assert.equal(qoder.sourceKind, "desktop-token");
+  assert.match(qoder.sourceName, /machine_token\.json:token/);
+  assert.equal(qoder.token, "qod****...oken");
+  assert.ok(parsed.skipped.some((group) => group.provider === "codex" && group.sources.some((source) => /登录态不能作为 OPENAI_API_KEY/.test(source.reason))));
+  assert.ok(parsed.skipped.some((group) => group.provider === "claude" && group.sources.some((source) => /不能作为 ANTHROPIC_API_KEY/.test(source.reason))));
+  assert.doesNotMatch(output, /qoder-desktop-machine-token/);
+  assert.doesNotMatch(output, /codex-desktop-access-token/);
+  assert.doesNotMatch(output, /claude-desktop-oauth-cache/);
+});
+
+test("credentials import syncs a Qoder desktop token from local storage", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "anyenv-cli-local-sync-"));
+  const home = path.join(dir, "home");
+  const config = path.join(dir, "config.json");
+  fs.mkdirSync(path.join(home, "Library", "Application Support", "Qoder", "SharedClientCache", "cache"), { recursive: true });
+  fs.writeFileSync(path.join(home, "Library", "Application Support", "Qoder", "SharedClientCache", "cache", "machine_token.json"), JSON.stringify({
+    token: "qoder-local-desktop-token",
+  }));
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    let raw = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      requests.push({
+        method: req.method,
+        url: req.url,
+        authorization: req.headers.authorization,
+        body: raw ? JSON.parse(raw) : null,
+      });
+      if (req.method === "GET" && req.url === "/api/v1/credentials") {
+        res.writeHead(200, { "Content-Type": "application/json", "Connection": "close" });
+        res.end(JSON.stringify([]));
+        return;
+      }
+      if (req.method === "POST" && req.url === "/api/v1/credentials") {
+        res.writeHead(201, { "Content-Type": "application/json", "Connection": "close" });
+        res.end(JSON.stringify({
+          id: "cred-qoder-local",
+          type: "api-key",
+          name: "Qoder CLI 访问令牌",
+          aiProvider: "qoder",
+          status: "connected",
+          secretConfigured: true,
+        }));
+        return;
+      }
+      if (req.method === "PUT" && req.url === "/api/v1/credentials/defaults/qoder") {
+        res.writeHead(200, { "Content-Type": "application/json", "Connection": "close" });
+        res.end(JSON.stringify({ credentialIds: { qoder: "cred-qoder-local" }, modelIds: {} }));
+        return;
+      }
+      res.writeHead(404, { "Content-Type": "application/json", "Connection": "close" });
+      res.end(JSON.stringify({ detail: `unexpected ${req.method} ${req.url}` }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address();
+    fs.writeFileSync(config, JSON.stringify({
+      apiBase: `http://127.0.0.1:${port}/api/v1`,
+      accessToken: "eyJ-cli-access-token",
+    }));
+    const output = await runAsync([
+      "credentials",
+      "import",
+      "--provider",
+      "qoder",
+      "--from-local",
+      "--yes",
+      "--json",
+    ], credentialTestEnv({ ANYENV_CONFIG: config, HOME: home }));
+    const parsed = JSON.parse(output);
+    assert.equal(parsed.ok, true);
+    assert.equal(parsed.items[0].source, "local");
+    assert.equal(parsed.items[0].sourceKind, "desktop-token");
+    assert.equal(parsed.items[0].credential.id, "cred-qoder-local");
+    assert.equal(requests[1].body.secret, "qoder-local-desktop-token");
+    assert.doesNotMatch(output, /qoder-local-desktop-token/);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+const hasSqlite3 = (() => {
+  try {
+    execFileSync("sqlite3", ["-version"], { encoding: "utf8", timeout: 5000 });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+test("credentials import reads Cursor desktop token from local sqlite storage", { skip: !hasSqlite3 }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "anyenv-cli-cursor-local-"));
+  const home = path.join(dir, "home");
+  const config = path.join(dir, "config.json");
+  const db = path.join(home, "Library", "Application Support", "Cursor", "User", "globalStorage", "state.vscdb");
+  fs.mkdirSync(path.dirname(db), { recursive: true });
+  fs.writeFileSync(config, JSON.stringify({ accessToken: "eyJ-cli-access-token" }));
+  execFileSync("sqlite3", [db, "create table ItemTable(key text primary key, value text); insert into ItemTable(key, value) values('cursorAuth/accessToken', 'cursor-desktop-access-token');"], { encoding: "utf8" });
+
+  const output = run([
+    "credentials",
+    "import",
+    "--provider",
+    "cursor",
+    "--from-local",
+    "--dry-run",
+    "--json",
+  ], credentialTestEnv({ ANYENV_CONFIG: config, HOME: home }));
+  const parsed = JSON.parse(output);
+  assert.equal(parsed.items[0].provider, "cursor");
+  assert.equal(parsed.items[0].aiProvider, "cursor");
+  assert.equal(parsed.items[0].sourceKind, "desktop-token");
+  assert.match(parsed.items[0].sourceName, /state\.vscdb:cursorAuth\/accessToken/);
+  assert.doesNotMatch(output, /cursor-desktop-access-token/);
 });
 
 test("login defaults back to production when stored API is localhost", async () => {
