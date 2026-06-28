@@ -1,6 +1,6 @@
 {
   "name": "@anyenv/cli",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "description": "AnyEnv local tool sync CLI and MCP stdio server.",
   "type": "module",
   "license": "MIT",
