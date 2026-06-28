@@ -1,0 +1,55 @@
+{
+  "name": "@anyenv/cli",
+  "version": "0.1.18",
+  "description": "AnyEnv local tool sync CLI and MCP stdio server.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anyenvcn/cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/anyenvcn/cli/issues"
+  },
+  "homepage": "https://github.com/anyenvcn/cli#readme",
+  "keywords": [
+    "anyenv",
+    "cli",
+    "mcp",
+    "local-agent",
+    "developer-tools"
+  ],
+  "bin": {
+    "anyenv": "./bin/anyenv.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "bundle": "node scripts/build-bundle.mjs",
+    "package:binaries": "node scripts/package-binaries.mjs",
+    "package:archives": "node scripts/package-archives.mjs",
+    "package": "npm run package:binaries && npm run package:archives",
+    "postpackage": "npm run smoke:packaged-daemon",
+    "smoke:packaged-daemon": "node scripts/smoke-packaged-daemon.mjs",
+    "prepublish:backend-data": "npm run package",
+    "publish:backend-data": "node scripts/publish-to-backend-data.mjs",
+    "postpublish:backend-data": "node scripts/verify-backend-data.mjs",
+    "publish:download-dir": "npm run package && node scripts/publish-to-backend-data.mjs && node scripts/verify-backend-data.mjs",
+    "verify:backend-data": "node scripts/verify-backend-data.mjs"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md",
+    "LICENSE"
+  ],
+  "devDependencies": {
+    "@yao-pkg/pkg": "6.12.0",
+    "esbuild": "0.28.1"
+  },
+  "dependencies": {
+    "ws": "^8.21.0"
+  }
+}
