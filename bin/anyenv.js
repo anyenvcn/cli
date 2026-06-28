@@ -27,6 +27,7 @@ import { connectDevice, localDevicePayload, registerAccountDevice, websocketBase
 import { startMcp } from "../lib/mcp.js";
 import { activationScript, cleanupCliArtifacts, formatBytes, resolveInstallDir, updateCli } from "../lib/update.js";
 import {
+  createCredential,
   createDeployment,
   createProject,
   createSession,
@@ -36,6 +37,7 @@ import {
   getProjectWorkspace,
   getSandbox,
   getSandboxLogs,
+  listCredentials,
   listAccountLocalClients,
   listDeployments,
   listProjects,
@@ -43,8 +45,10 @@ import {
   anyenvCloudApiError,
   rollbackDeployment,
   sendCodingMessage,
+  setAgentDefaultCredential,
   startSandbox,
   stopSandbox,
+  updateCredential,
 } from "../lib/cloud-api.js";
 
 let activeArgs = null;
@@ -73,6 +77,8 @@ Cloud operations (uses user access token):
   anyenv projects list [--json]
   anyenv projects create --name <name> [--workspace-id <id>] [--json]
   anyenv projects get --project <id> [--json]
+  anyenv credentials import --provider codex|claude|cursor|qwen|opencode|qoder [--token <token>|--from-env <name>|--from-file <path>] [--name <name>] [--dry-run] [--yes] [--json]
+  anyenv credentials import --all [--dry-run] [--yes] [--json]
   anyenv coding --project <id> [--prompt <text>] [--session <id>] [--agent <id>] [--model <model>] [--json]
   anyenv deploy list|create|status|rollback|readiness --project <id> [--json]
   anyenv sandbox status|start|stop|logs --project <id> [--remove] [--tail 200] [--json]
@@ -485,6 +491,287 @@ function commandPrompt(args, startIndex = 1) {
 
 function printProject(project) {
   process.stdout.write(`${project.id}\t${project.name || ""}\t${project.status || ""}\n`);
+}
+
+const CREDENTIAL_IMPORT_PROVIDERS = {
+  codex: {
+    provider: "codex",
+    label: "Codex",
+    agentId: "codex",
+    aiProvider: "openai",
+    envVars: ["OPENAI_API_KEY"],
+    name: "Codex OpenAI API Key",
+    modelIds: [],
+  },
+  claude: {
+    provider: "claude",
+    label: "Claude Code",
+    agentId: "claude",
+    aiProvider: "anthropic",
+    envVars: ["ANTHROPIC_API_KEY"],
+    name: "Claude Code Anthropic API Key",
+    modelIds: [],
+  },
+  cursor: {
+    provider: "cursor",
+    label: "Cursor Agent",
+    agentId: "cursor",
+    aiProvider: "cursor",
+    envVars: ["CURSOR_API_KEY"],
+    name: "Cursor Agent CLI 访问令牌",
+    modelIds: [],
+  },
+  qwen: {
+    provider: "qwen",
+    label: "Qwen Code",
+    agentId: "qwen",
+    aiProvider: "dashscope",
+    envVars: ["DASHSCOPE_API_KEY", "OPENAI_API_KEY"],
+    envProviderMap: {
+      DASHSCOPE_API_KEY: "dashscope",
+      OPENAI_API_KEY: "openai",
+    },
+    baseUrlByProvider: {
+      dashscope: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      openai: "https://api.openai.com/v1",
+    },
+    name: "Qwen Code API Key",
+    modelIds: [],
+  },
+  opencode: {
+    provider: "opencode",
+    label: "OpenCode",
+    agentId: "opencode",
+    aiProvider: "openai",
+    envVars: ["OPENAI_API_KEY"],
+    name: "OpenCode OpenAI API Key",
+    modelIds: [],
+  },
+  qoder: {
+    provider: "qoder",
+    label: "Qoder CLI",
+    agentId: "qoder",
+    aiProvider: "qoder",
+    envVars: ["QODER_PERSONAL_ACCESS_TOKEN"],
+    name: "Qoder CLI 访问令牌",
+    modelIds: [],
+  },
+};
+
+function normalizeCredentialImportProvider(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  const aliases = {
+    "claude-code": "claude",
+    "cursor-agent": "cursor",
+    qodercli: "qoder",
+    qwencli: "qwen",
+    qwen_code: "qwen",
+    "qwen-code": "qwen",
+    openai: "codex",
+  };
+  return aliases[raw] || raw;
+}
+
+function knownCredentialImportProviders() {
+  return Object.keys(CREDENTIAL_IMPORT_PROVIDERS).join("|");
+}
+
+function readCredentialTokenFile(file) {
+  const raw = fs.readFileSync(path.resolve(file), "utf8").trim();
+  if (!raw) return "";
+  if (raw.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(raw);
+      const keys = [
+        "token",
+        "accessToken",
+        "access_token",
+        "apiKey",
+        "api_key",
+        "key",
+        "secret",
+        "personalAccessToken",
+        "personal_access_token",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "DASHSCOPE_API_KEY",
+        "CURSOR_API_KEY",
+        "QODER_PERSONAL_ACCESS_TOKEN",
+      ];
+      for (const key of keys) {
+        const value = String(parsed?.[key] || "").trim();
+        if (value) return value;
+      }
+    } catch {}
+  }
+  return raw;
+}
+
+function credentialImportToken(args, provider) {
+  if (args.token) return { token: String(args.token).trim(), source: "flag", sourceName: "--token" };
+  const fromEnv = args["from-env"] || args.fromEnv || "";
+  if (fromEnv) {
+    return {
+      token: String(process.env[fromEnv] || "").trim(),
+      source: "env",
+      sourceName: fromEnv,
+    };
+  }
+  const fromFile = args["from-file"] || args.fromFile || "";
+  if (fromFile) {
+    return {
+      token: readCredentialTokenFile(fromFile),
+      source: "file",
+      sourceName: path.resolve(fromFile),
+    };
+  }
+  for (const envName of provider.envVars || []) {
+    const token = String(process.env[envName] || "").trim();
+    if (token) return { token, source: "env", sourceName: envName };
+  }
+  return { token: "", source: "", sourceName: "" };
+}
+
+function credentialImportBody(args, provider, tokenInfo) {
+  const providerFromEnv = provider.envProviderMap?.[tokenInfo.sourceName] || "";
+  const aiProvider = args["ai-provider"] || args.aiProvider || providerFromEnv || provider.aiProvider;
+  const model = args.model || args["model-id"] || "";
+  const body = {
+    type: "api-key",
+    name: args.name || provider.name,
+    aiProvider,
+    modelIds: model ? [model] : [...(provider.modelIds || [])],
+    secret: tokenInfo.token,
+    secretConfigured: true,
+  };
+  const baseUrl = args["base-url"] || args.baseUrl || provider.baseUrlByProvider?.[aiProvider] || "";
+  if (baseUrl) body.baseUrl = baseUrl;
+  return body;
+}
+
+function sameImportCredential(item, body) {
+  if (!item || item.system === true || item.type !== "api-key") return false;
+  return String(item.name || "") === String(body.name || "")
+    && String(item.aiProvider || "") === String(body.aiProvider || "");
+}
+
+async function confirmCredentialImport(args, plan) {
+  if (args["dry-run"]) return;
+  if (args.yes || args.confirm) return;
+  if (!process.stdin.isTTY) {
+    throw new Error("导入凭证会把本机 token 加密同步到云端凭证管理。请在确认后加 --yes，或先用 --dry-run 预览。");
+  }
+  const rl = readline.createInterface({ input, output });
+  try {
+    const names = plan.map((item) => `${item.provider.label}(${item.body.name})`).join(", ");
+    const answer = (await rl.question(`确认同步以下本机凭证到 AnyEnv 云端凭证管理？${names} [y/N] `)).trim().toLowerCase();
+    if (answer !== "y" && answer !== "yes") throw new Error("已取消导入。");
+  } finally {
+    rl.close();
+  }
+}
+
+function credentialImportPlan(args) {
+  const all = Boolean(args.all || args.provider === "all");
+  const providerIds = all
+    ? Object.keys(CREDENTIAL_IMPORT_PROVIDERS)
+    : [normalizeCredentialImportProvider(args.provider || args._[2])];
+  if (!providerIds[0]) {
+    throw new Error(`缺少 provider。请使用 --provider ${knownCredentialImportProviders()}，或 --all。`);
+  }
+  const plan = [];
+  const missing = [];
+  for (const providerId of providerIds) {
+    const provider = CREDENTIAL_IMPORT_PROVIDERS[providerId];
+    if (!provider) throw new Error(`未知凭证导入 provider: ${providerId}。支持: ${knownCredentialImportProviders()}`);
+    const tokenInfo = credentialImportToken(args, provider);
+    if (!tokenInfo.token) {
+      missing.push({
+        provider,
+        envVars: provider.envVars || [],
+      });
+      continue;
+    }
+    const body = credentialImportBody(args, provider, tokenInfo);
+    plan.push({
+      provider,
+      tokenInfo: {
+        source: tokenInfo.source,
+        sourceName: tokenInfo.sourceName,
+        token: maskToken(tokenInfo.token),
+      },
+      body,
+    });
+  }
+  if (!plan.length) {
+    const hint = missing
+      .map((item) => `${item.provider.label}: ${item.envVars.join(" / ")}`)
+      .join("; ");
+    throw new Error(`没有发现可导入的本机凭证。请设置环境变量、使用 --token，或使用 --from-file。${hint ? ` 默认环境变量: ${hint}` : ""}`);
+  }
+  return plan;
+}
+
+async function syncCredentialImport(config, item, args, existingCredentials) {
+  const existing = existingCredentials.find((credential) => sameImportCredential(credential, item.body));
+  const credential = existing
+    ? await updateCredential(config, existing.id, item.body)
+    : await createCredential(config, item.body);
+  let defaultResult = null;
+  if (!args["no-default"] && item.provider.agentId && credential?.id) {
+    defaultResult = await setAgentDefaultCredential(config, item.provider.agentId, credential.id);
+  }
+  return {
+    action: existing ? "updated" : "created",
+    provider: item.provider.provider,
+    label: item.provider.label,
+    aiProvider: item.body.aiProvider,
+    source: item.tokenInfo.source,
+    sourceName: item.tokenInfo.sourceName,
+    token: item.tokenInfo.token,
+    defaultAgentId: defaultResult ? item.provider.agentId : "",
+    credential,
+  };
+}
+
+async function cmdCredentials(args) {
+  const action = args._[1] || "list";
+  if (action !== "import") throw new Error(`未知 credentials 命令: ${action}`);
+  const config = resolveConfig(args);
+  const plan = credentialImportPlan(args);
+  if (args["dry-run"]) {
+    const preview = plan.map((item) => ({
+      provider: item.provider.provider,
+      label: item.provider.label,
+      aiProvider: item.body.aiProvider,
+      name: item.body.name,
+      source: item.tokenInfo.source,
+      sourceName: item.tokenInfo.sourceName,
+      token: item.tokenInfo.token,
+      setDefaultAgentId: args["no-default"] ? "" : item.provider.agentId,
+    }));
+    if (args.json) printJson({ dryRun: true, items: preview });
+    else for (const item of preview) {
+      process.stdout.write(`${item.label}: ${item.name} (${item.aiProvider}) from ${item.sourceName || item.source}; token ${item.token}\n`);
+    }
+    return;
+  }
+  await confirmCredentialImport(args, plan);
+  const existing = await listCredentials(config);
+  const existingItems = Array.isArray(existing) ? existing : existing.items || [];
+  const results = [];
+  for (const item of plan) {
+    results.push(await syncCredentialImport(config, item, args, existingItems));
+  }
+  if (args.json) {
+    printJson({ ok: true, items: results });
+    return;
+  }
+  for (const item of results) {
+    process.stdout.write(`${item.action === "updated" ? "Updated" : "Created"} credential: ${item.credential.name} (${item.aiProvider})\n`);
+    process.stdout.write(`Source: ${item.sourceName || item.source}; token ${item.token}\n`);
+    if (item.defaultAgentId) process.stdout.write(`Default agent credential: ${item.defaultAgentId}\n`);
+  }
 }
 
 function printDeployment(deployment) {
@@ -1853,6 +2140,7 @@ async function main() {
   if (scope === "projects" && (!action || action === "list")) return cmdProjectsList(args);
   if (scope === "projects" && action === "create") return cmdProjectsCreate(args);
   if (scope === "projects" && action === "get") return cmdProjectsGet(args);
+  if (scope === "credentials") return cmdCredentials(args);
   if (scope === "coding") return cmdCoding(args);
   if (scope === "deploy") return cmdDeploy(args);
   if (scope === "sandbox") return cmdSandbox(args);

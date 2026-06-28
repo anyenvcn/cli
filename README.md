@@ -271,6 +271,50 @@ anyenv context workspace --project '<projectId>' --json
 
 用于查看项目摘要、记忆、知识库和工具配置，不依赖 MCP 客户端。
 
+## 同步本机 AI Coding 凭证
+
+如果本机已经有 Codex、Claude Code、Cursor Agent、Qwen Code、OpenCode 或 Qoder CLI 的 API Key / 访问令牌，可以通过 CLI 显式同步到「凭证与管理」。同步会复用同名同 provider 的已有凭证；存在则更新，不存在则创建。同步成功后默认把对应 agent 的默认凭证指向它，Workbench 可直接使用。
+
+预览，不上传:
+
+```bash
+anyenv credentials import --provider qoder --dry-run
+anyenv credentials import --all --dry-run --json
+```
+
+同步单个 provider:
+
+```bash
+anyenv credentials import --provider codex --yes
+anyenv credentials import --provider qoder --yes
+```
+
+显式传入 token 或文件:
+
+```bash
+anyenv credentials import --provider qoder --token '<token>' --yes
+anyenv credentials import --provider codex --from-file ./openai-key.txt --yes
+```
+
+默认识别的环境变量:
+
+| provider | 默认环境变量 | 写入凭证 provider |
+|---|---|---|
+| `codex` | `OPENAI_API_KEY` | `openai` |
+| `claude` | `ANTHROPIC_API_KEY` | `anthropic` |
+| `cursor` | `CURSOR_API_KEY` | `cursor` |
+| `qwen` | `DASHSCOPE_API_KEY` / `OPENAI_API_KEY` | `dashscope` / `openai` |
+| `opencode` | `OPENAI_API_KEY` | `openai` |
+| `qoder` | `QODER_PERSONAL_ACCESS_TOKEN` | `qoder` |
+
+如果只想同步凭证、不修改默认 agent:
+
+```bash
+anyenv credentials import --provider qoder --no-default --yes
+```
+
+该命令只在用户明确运行时上传 token。不会自动读取 `~/.codex/auth.json`、系统 Keychain 或各家 CLI 的完整网页登录态文件。
+
 ## 本地目录登记
 
 账号级本地目录登记用于把本机已有项目作为云端新项目的导入来源。该能力必须使用 `anyenv login` 创建的全局 Token；用户 access token 只能用于云端业务命令，不能登记本地目录。

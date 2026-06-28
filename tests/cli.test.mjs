@@ -1030,6 +1030,196 @@ test("auth status masks user access token", () => {
   assert.doesNotMatch(output, /access-token-for-cloud-resources/);
 });
 
+test("credentials import syncs a qoder token and sets the default agent credential", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "anyenv-cli-test-"));
+  const config = path.join(dir, "config.json");
+  fs.writeFileSync(config, JSON.stringify({
+    apiBase: "http://127.0.0.1:1/api/v1",
+    accessToken: "eyJ-cli-access-token",
+  }));
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    let raw = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      requests.push({
+        method: req.method,
+        url: req.url,
+        authorization: req.headers.authorization,
+        body: raw ? JSON.parse(raw) : null,
+      });
+      if (req.method === "GET" && req.url === "/api/v1/credentials") {
+        res.writeHead(200, { "Content-Type": "application/json", "Connection": "close" });
+        res.end(JSON.stringify([]));
+        return;
+      }
+      if (req.method === "POST" && req.url === "/api/v1/credentials") {
+        res.writeHead(201, { "Content-Type": "application/json", "Connection": "close" });
+        res.end(JSON.stringify({
+          id: "cred-qoder",
+          type: "api-key",
+          name: "Qoder CLI 访问令牌",
+          aiProvider: "qoder",
+          status: "connected",
+          secretConfigured: true,
+        }));
+        return;
+      }
+      if (req.method === "PUT" && req.url === "/api/v1/credentials/defaults/qoder") {
+        res.writeHead(200, { "Content-Type": "application/json", "Connection": "close" });
+        res.end(JSON.stringify({ credentialIds: { qoder: "cred-qoder" }, modelIds: {} }));
+        return;
+      }
+      res.writeHead(404, { "Content-Type": "application/json", "Connection": "close" });
+      res.end(JSON.stringify({ detail: `unexpected ${req.method} ${req.url}` }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address();
+    fs.writeFileSync(config, JSON.stringify({
+      apiBase: `http://127.0.0.1:${port}/api/v1`,
+      accessToken: "eyJ-cli-access-token",
+    }));
+    const output = await runAsync([
+      "credentials",
+      "import",
+      "--provider",
+      "qoder",
+      "--yes",
+      "--json",
+    ], {
+      ANYENV_CONFIG: config,
+      QODER_PERSONAL_ACCESS_TOKEN: "qoder-secret-token-value",
+    });
+    const parsed = JSON.parse(output);
+    assert.equal(parsed.ok, true);
+    assert.equal(parsed.items[0].action, "created");
+    assert.equal(parsed.items[0].credential.id, "cred-qoder");
+    assert.equal(parsed.items[0].defaultAgentId, "qoder");
+    assert.doesNotMatch(output, /qoder-secret-token-value/);
+
+    assert.deepEqual(requests.map((request) => `${request.method} ${request.url}`), [
+      "GET /api/v1/credentials",
+      "POST /api/v1/credentials",
+      "PUT /api/v1/credentials/defaults/qoder",
+    ]);
+    assert.ok(requests.every((request) => request.authorization === "Bearer eyJ-cli-access-token"));
+    assert.equal(requests[1].body.type, "api-key");
+    assert.equal(requests[1].body.aiProvider, "qoder");
+    assert.equal(requests[1].body.secret, "qoder-secret-token-value");
+    assert.equal(requests[2].body.credentialId, "cred-qoder");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("credentials import updates an existing provider credential by name", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "anyenv-cli-test-"));
+  const config = path.join(dir, "config.json");
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    let raw = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      requests.push({
+        method: req.method,
+        url: req.url,
+        authorization: req.headers.authorization,
+        body: raw ? JSON.parse(raw) : null,
+      });
+      if (req.method === "GET" && req.url === "/api/v1/credentials") {
+        res.writeHead(200, { "Content-Type": "application/json", "Connection": "close" });
+        res.end(JSON.stringify([
+          {
+            id: "cred-existing-codex",
+            type: "api-key",
+            name: "Codex OpenAI API Key",
+            aiProvider: "openai",
+            secretConfigured: true,
+          },
+        ]));
+        return;
+      }
+      if (req.method === "PUT" && req.url === "/api/v1/credentials/cred-existing-codex") {
+        res.writeHead(200, { "Content-Type": "application/json", "Connection": "close" });
+        res.end(JSON.stringify({
+          id: "cred-existing-codex",
+          type: "api-key",
+          name: "Codex OpenAI API Key",
+          aiProvider: "openai",
+          status: "connected",
+          secretConfigured: true,
+        }));
+        return;
+      }
+      if (req.method === "PUT" && req.url === "/api/v1/credentials/defaults/codex") {
+        res.writeHead(200, { "Content-Type": "application/json", "Connection": "close" });
+        res.end(JSON.stringify({ credentialIds: { codex: "cred-existing-codex" }, modelIds: {} }));
+        return;
+      }
+      res.writeHead(404, { "Content-Type": "application/json", "Connection": "close" });
+      res.end(JSON.stringify({ detail: `unexpected ${req.method} ${req.url}` }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address();
+    fs.writeFileSync(config, JSON.stringify({
+      apiBase: `http://127.0.0.1:${port}/api/v1`,
+      accessToken: "eyJ-cli-access-token",
+    }));
+    const output = await runAsync([
+      "credentials",
+      "import",
+      "--provider",
+      "codex",
+      "--token",
+      "sk-local-openai-token",
+      "--yes",
+      "--json",
+    ], { ANYENV_CONFIG: config });
+    const parsed = JSON.parse(output);
+    assert.equal(parsed.items[0].action, "updated");
+    assert.equal(parsed.items[0].credential.id, "cred-existing-codex");
+    assert.doesNotMatch(output, /sk-local-openai-token/);
+    assert.deepEqual(requests.map((request) => `${request.method} ${request.url}`), [
+      "GET /api/v1/credentials",
+      "PUT /api/v1/credentials/cred-existing-codex",
+      "PUT /api/v1/credentials/defaults/codex",
+    ]);
+    assert.equal(requests[1].body.aiProvider, "openai");
+    assert.equal(requests[1].body.secret, "sk-local-openai-token");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("credentials import dry-run previews detected token without uploading it", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "anyenv-cli-test-"));
+  const config = path.join(dir, "config.json");
+  fs.writeFileSync(config, JSON.stringify({ accessToken: "eyJ-cli-access-token" }));
+  const output = run([
+    "credentials",
+    "import",
+    "--provider",
+    "qoder",
+    "--dry-run",
+    "--json",
+  ], {
+    ANYENV_CONFIG: config,
+    QODER_PERSONAL_ACCESS_TOKEN: "qoder-secret-token-value",
+  });
+  const parsed = JSON.parse(output);
+  assert.equal(parsed.dryRun, true);
+  assert.equal(parsed.items[0].provider, "qoder");
+  assert.equal(parsed.items[0].aiProvider, "qoder");
+  assert.equal(parsed.items[0].setDefaultAgentId, "qoder");
+  assert.doesNotMatch(output, /qoder-secret-token-value/);
+});
+
 test("login defaults back to production when stored API is localhost", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "anyenv-cli-test-"));
   const config = path.join(dir, "config.json");
