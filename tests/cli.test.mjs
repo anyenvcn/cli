@@ -314,6 +314,10 @@ test("local agent-run writes provider-native answer envelope back to child stdin
     assert.equal(askBody.part.toolName, "requestUserInput");
     assert.equal(askBody.wait, true);
     assert.equal(askBody.dryRun, false);
+    await waitFor(
+      () => events.some((event) => event.event === "provider_native.write_back.delivered" && event.auditReported === true),
+      1000,
+    );
     assert.equal(reportBody.interactionId, "int_cli_native");
     assert.equal(reportBody.toolUseId, "toolu_cli_native");
     assert.equal(reportBody.status, "delivered");
@@ -324,10 +328,6 @@ test("local agent-run writes provider-native answer envelope back to child stdin
     assert.match(reportBody.payloadTextSha256, /^[a-f0-9]{64}$/);
     assert.match(response.stdout, /provider-native:\{"type":"tool_result"/);
     assert.ok(events.some((event) => event.event === "provider_native.interaction.required"));
-    await waitFor(
-      () => events.some((event) => event.event === "provider_native.write_back.delivered" && event.auditReported === true),
-      1000,
-    );
   } finally {
     process.env.PATH = oldPath;
     await new Promise((resolve) => server.close(resolve));
