@@ -110,6 +110,7 @@ test("help includes local device connection commands", () => {
   assert.doesNotMatch(output, /--once/);
   assert.match(output, /--allow-local-commands/);
   assert.match(output, /--allow-remote-desktop/);
+  assert.doesNotMatch(output, /--allow-remote-desktop \[--workspace/);
   assert.match(output, /--base-url/);
   assert.match(output, /cursor\|claude\|vscode\|generic/);
 });
@@ -2798,8 +2799,6 @@ test("start foreground opens a real local PTY shell over websocket", async () =>
 test("start foreground bridges local VNC bytes when remote desktop is explicitly enabled", async () => {
   const { WebSocketServer } = await import("ws");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "anyenv-cli-vnc-e2e-"));
-  const workspaceDir = path.join(dir, "workspace");
-  fs.mkdirSync(workspaceDir);
   const config = path.join(dir, "config.json");
   fs.writeFileSync(config, JSON.stringify({
     apiBase: "http://127.0.0.1:1/api/v1",
@@ -2905,8 +2904,6 @@ test("start foreground bridges local VNC bytes when remote desktop is explicitly
       "--json",
       "--api",
       `http://127.0.0.1:${port}/api/v1`,
-      "--workspace",
-      workspaceDir,
       "--allow-remote-desktop",
       "--vnc-port",
       String(vncPort),
@@ -2926,6 +2923,8 @@ test("start foreground bridges local VNC bytes when remote desktop is explicitly
     await waitFor(() => openResponse && vncBannerFrame && tcpReceived.includes("browser-to-vnc"), 10000);
     assert.ok(registerBody.capabilities.includes("remote-desktop"));
     assert.ok(registerBody.capabilities.includes("remote-desktop:vnc"));
+    assert.ok(!registerBody.capabilities.includes("local-workspace"));
+    assert.deepEqual(registerBody.workspaces, []);
     assert.equal(registerBody.metadata.remoteDesktop.enabled, true);
     assert.equal(registerBody.metadata.remoteDesktop.port, vncPort);
     assert.ok(authMessage.capabilities.includes("remote-desktop:vnc"));

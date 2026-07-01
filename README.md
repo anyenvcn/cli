@@ -62,6 +62,27 @@ anyenv --version
 anyenv --help
 ```
 
+账号级本地客户端最快路径:
+
+```bash
+# 授权登录
+anyenv login
+
+# 登记本地目录
+anyenv local workspace add /path/to/project --name "Local Project"
+
+# 保持在线:网页、手机和 IM 可看到本机在线、目录和工具状态
+anyenv start --workspace /path/to/project
+
+# 可选:允许网页/手机/IM 请求本机命令行
+anyenv restart --workspace /path/to/project \
+  --allow-local-commands \
+  --command-root /path/to/project \
+  --command-timeout 120
+```
+
+默认只登记目录和在线状态，不开放本机命令。参数名是复数 `--allow-local-commands`；`--command-root` 会限制远程命令允许进入和执行的目录范围。
+
 自定义安装位置:
 
 ```bash
@@ -416,8 +437,8 @@ anyenv stop
 - 本地设备通过出站连接访问云端，不要求本机暴露公网端口。
 - `anyenv start` 只使用账号级 `local_client:write` 权限；项目 Token 只用于项目同步/MCP，不用于本地设备在线。
 - `--workspace` / `--dir` 是本地目录 allowlist；网页不会自动扫描磁盘，WebSocket 心跳也不能扩大这个 allowlist。
-- 默认不开放云端任意命令执行。
-- 后续远程执行必须具备权限、审批、审计、命令白名单和计量能力。
+- 默认不开放云端任意命令执行；只有显式带 `--allow-local-commands` 在线时，网页、手机或 IM 才能在 `--command-root` 范围内请求本机命令。
+- 远程执行必须具备权限、审计、超时和可撤销边界；远程桌面只需要显式带 `--allow-remote-desktop` 并先在本机开启 VNC 或系统屏幕共享。`--vnc-port` 只是本机 VNC 源端口的可选覆盖，浏览器始终通过 AnyEnv WebSocket 中继连接，不要求本机暴露公网端口或登记额外目录。
 
 ## MCP
 

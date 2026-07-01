@@ -87,7 +87,7 @@ Cloud operations (uses user access token):
 Device agent (local command execution is experimental and off by default):
   anyenv start [--workspace <path>] [--name <name>] [--debug] [--json]
   anyenv start --allow-local-commands [--workspace <path>] [--command-root <path>] [--command-timeout <sec>]
-  anyenv start --allow-remote-desktop [--workspace <path>] [--vnc-port 5900]
+  anyenv start --allow-remote-desktop [--vnc-port 5900]
   anyenv start --foreground [--workspace <path>] [--name <name>] [--json]
   anyenv status [--json]
   anyenv logs [--tail 80] [--follow] [--json]
@@ -2181,6 +2181,9 @@ async function cmdStart(args) {
     if (result.payload.metadata?.commandExecution?.enabled) {
       process.stdout.write(`Local commands: enabled (root: ${result.payload.metadata.commandExecution.root})\n`);
     }
+    if (result.payload.metadata?.remoteDesktop?.enabled) {
+      process.stdout.write(`Remote desktop: enabled (AnyEnv WebSocket relay, local VNC source 127.0.0.1:${result.payload.metadata.remoteDesktop.port || 5900})\n`);
+    }
     if (!args.once) process.stdout.write("Connection is active. Press Ctrl+C to stop.\n");
     return;
   }
@@ -2280,7 +2283,7 @@ async function cmdStart(args) {
     process.stdout.write(`Local commands: enabled (root: ${commandOptions.commandRoot || process.cwd()})\n`);
   }
   if (commandOptions.allowRemoteDesktop) {
-    process.stdout.write(`Remote desktop: enabled (VNC 127.0.0.1:${Number(commandOptions.vncPort || 5900)})\n`);
+    process.stdout.write(`Remote desktop: enabled (AnyEnv WebSocket relay, local VNC source 127.0.0.1:${Number(commandOptions.vncPort || 5900)})\n`);
   }
   process.stdout.write("Use anyenv status, anyenv stop, or anyenv restart to manage it.\n");
 }
