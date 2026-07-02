@@ -2103,16 +2103,100 @@ function isLocalDeviceAuthFailure(message) {
   return /Token is invalid|missing local-device permission|local-device permission|Local device connection authentication failed|auth failed|authentication failed/i.test(String(message || ""));
 }
 
+function formatDurationSeconds(seconds) {
+  const value = Math.max(0, Number(seconds || 0));
+  if (!Number.isFinite(value) || value <= 0) return "just now";
+  if (value < 60) return `${Math.round(value)}s ago`;
+  if (value < 3600) return `${Math.round(value / 60)}m ago`;
+  if (value < 86400) return `${Math.round(value / 3600)}h ago`;
+  return `${Math.round(value / 86400)}d ago`;
+}
+
+function timestampFromDaemonLogLine(line) {
+  const match = String(line || "").match(/\]\s+(\d{4}-\d{2}-\d{2}T[0-9:.]+Z)\s+/);
+  return match ? match[1] : "";
+}
+
+function secondsSinceIso(value) {
+  const parsed = Date.parse(value || "");
+  if (!Number.isFinite(parsed)) return null;
+  return Math.max(0, Math.round((Date.now() - parsed) / 1000));
+}
+
 function daemonStaleDiagnostic(status) {
   const logTail = normalizeCliErrorMessage(daemonLogTail(status.logPath));
-  if (!logTail) return null;
+  const state = status.state || {};
+  if (!logTail && !state.lastEvent && !state.lastExit && !state.lastSignal) return null;
   const authFailure = isLocalDeviceAuthFailure(logTail);
-  return {
+  const lastLogAt = timestampFromDaemonLogLine(logTail);
+  const diagnosticStaleForSeconds = secondsSinceIso(state.lastEventAt || state.lastHeartbeatAt || lastLogAt)
+    ?? status.staleForSeconds;
+  const staleText = diagnosticStaleForSeconds === null || diagnosticStaleForSeconds === undefined
+    ? ""
+    : `Last activity was ${formatDurationSeconds(diagnosticStaleForSeconds)}.`;
+  const common = {
     lastLog: logTail,
-    code: authFailure ? "local_device_auth_failed" : "daemon_exited",
-    nextStep: authFailure
-      ? "Run anyenv login --account, then retry anyenv start --workspace ."
-      : `Inspect ${status.logPath}, then run anyenv restart --workspace .`,
+    lastLogAt,
+    lastEvent: state.lastEvent || "",
+    lastEventAt: state.lastEventAt || "",
+    lastHeartbeatAt: state.lastHeartbeatAt || "",
+    staleForSeconds: diagnosticStaleForSeconds,
+  };
+  if (authFailure) {
+    return {
+      ...common,
+      code: "local_device_auth_failed",
+      explanation: "The daemon stopped because the cloud rejected the local-device authentication.",
+      nextStep: "Run anyenv login --account, then retry anyenv start --workspace .",
+    };
+  }
+  if (state.lastExit?.reason === "uncaught_exception") {
+    return {
+      ...common,
+      code: "daemon_crashed",
+      explanation: `The daemon recorded an uncaught exception before exiting. ${state.lastExit.message || ""}`.trim(),
+      nextStep: `Inspect ${status.logPath}, then run anyenv restart --workspace .`,
+    };
+  }
+  if (state.lastSignal?.signal) {
+    return {
+      ...common,
+      code: "daemon_stopped_by_signal",
+      explanation: `The daemon received ${state.lastSignal.signal}. This usually means anyenv stop/restart, Ctrl+C, terminal close, or session shutdown.`,
+      nextStep: "Run anyenv restart --workspace . if you want it online again.",
+    };
+  }
+  if (state.lastExit) {
+    return {
+      ...common,
+      code: Number(state.lastExit.code || 0) === 0 ? "daemon_exited_cleanly" : "daemon_exited_with_error",
+      explanation: `The daemon recorded process exit code ${Number(state.lastExit.code || 0)}.`,
+      nextStep: Number(state.lastExit.code || 0) === 0
+        ? "Run anyenv restart --workspace . if this was not intentional."
+        : `Inspect ${status.logPath}, then run anyenv restart --workspace .`,
+    };
+  }
+  if (/ws\.heartbeat\.sent/.test(logTail) || state.lastEvent === "ws.heartbeat.sent") {
+    return {
+      ...common,
+      code: "daemon_disappeared_after_heartbeat",
+      explanation: `The last daemon event was a healthy heartbeat, but the PID is gone and no exit signal was recorded. ${staleText} This points more to terminal/session shutdown, sleep, force kill, or an external supervisor than to a CLI cache issue.`.trim(),
+      nextStep: "Run anyenv restart --workspace .; if it repeats, keep anyenv logs --follow open and check macOS crash/energy logs.",
+    };
+  }
+  if (/ws\.close|ws\.reconnect/.test(logTail) || /^ws\.reconnect\./.test(state.lastEvent || "") || state.lastWebSocketClose) {
+    return {
+      ...common,
+      code: "websocket_reconnect_then_daemon_disappeared",
+      explanation: `The daemon was handling a WebSocket disconnect/reconnect before it disappeared. ${staleText} This is network/cloud-channel related unless a later exit record appears.`.trim(),
+      nextStep: `Inspect ${status.logPath}, then run anyenv restart --workspace .`,
+    };
+  }
+  return {
+    ...common,
+    code: "daemon_exited",
+    explanation: `The daemon PID is gone, but there is not enough lifecycle detail in the log to identify the exact reason. ${staleText}`.trim(),
+    nextStep: `Inspect ${status.logPath}, then run anyenv restart --workspace .`,
   };
 }
 
@@ -2312,6 +2396,9 @@ function cmdDaemonStatus(args) {
     process.stdout.write(`AnyEnv daemon is not running; stale state found for PID ${status.state.pid}.\n`);
     if (status.diagnostic?.lastLog) {
       process.stdout.write(`Last log: ${status.diagnostic.lastLog}\n`);
+    }
+    if (status.diagnostic?.explanation) {
+      process.stdout.write(`Diagnostic: ${status.diagnostic.explanation}\n`);
     }
     if (status.diagnostic?.nextStep) {
       process.stdout.write(`Next step: ${status.diagnostic.nextStep}\n`);

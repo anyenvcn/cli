@@ -95,6 +95,13 @@ test("config path prints the active config file", () => {
   assert.equal(run(["config", "path"], { ANYENV_CONFIG: config }).trim(), config);
 });
 
+test("package version matches CLI version constant", async () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+  const { VERSION } = await import("../lib/config.js");
+  assert.equal(VERSION, pkg.version);
+  assert.equal(run(["--version"]).trim(), pkg.version);
+});
+
 test("help includes local device connection commands", () => {
   const output = run(["--help"]);
   assert.match(output, /Connect IDE\/MCP/);
@@ -2036,6 +2043,39 @@ test("daemon status surfaces stale auth failure diagnostics", () => {
   assert.equal(parsed.stale, true);
   assert.equal(parsed.diagnostic.code, "local_device_auth_failed");
   assert.match(parsed.diagnostic.nextStep, /anyenv login --account/);
+});
+
+test("daemon status explains stale heartbeat without an exit record", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "anyenv-cli-test-"));
+  const config = path.join(dir, "config.json");
+  const logPath = path.join(dir, "daemon.log");
+  const now = new Date(Date.now() - 90_000).toISOString();
+  fs.writeFileSync(config, JSON.stringify({ apiBase: "http://127.0.0.1:36732/api/v1" }));
+  fs.writeFileSync(path.join(dir, "daemon.json"), JSON.stringify({
+    pid: 99999999,
+    scope: "account",
+    projectId: "",
+    logPath,
+    startedAt: new Date(Date.now() - 300_000).toISOString(),
+    lastEvent: "ws.heartbeat.sent",
+    lastEventAt: now,
+    lastHeartbeatAt: now,
+  }));
+  fs.writeFileSync(logPath, [
+    `[AnyEnv:device] ${now} ws.heartbeat.sent {"runId":"lrun_test","connectionId":"lconn_test","attempt":2}`,
+  ].join("\n"));
+
+  const human = run(["status"], { ANYENV_CONFIG: config });
+  assert.match(human, /stale state found/);
+  assert.match(human, /Diagnostic: The last daemon event was a healthy heartbeat/);
+  assert.match(human, /CLI cache issue/);
+
+  const parsed = JSON.parse(run(["status", "--json"], { ANYENV_CONFIG: config }));
+  assert.equal(parsed.running, false);
+  assert.equal(parsed.stale, true);
+  assert.equal(parsed.diagnostic.code, "daemon_disappeared_after_heartbeat");
+  assert.equal(parsed.diagnostic.lastEvent, "ws.heartbeat.sent");
+  assert.equal(parsed.diagnostic.lastHeartbeatAt, now);
 });
 
 test("start dry-run plans a foreground daemon without exposing tokens", () => {
