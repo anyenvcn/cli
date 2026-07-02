@@ -102,8 +102,11 @@ if [ -z "$BIN" ]; then
 fi
 
 mkdir -p "$INSTALL_DIR"
-cp "$BIN" "$INSTALL_DIR/anyenv"
-chmod 755 "$INSTALL_DIR/anyenv"
+INSTALL_TARGET="$INSTALL_DIR/anyenv"
+INSTALL_TMP="$INSTALL_TARGET.tmp.$$"
+cp "$BIN" "$INSTALL_TMP"
+chmod 755 "$INSTALL_TMP"
+mv -f "$INSTALL_TMP" "$INSTALL_TARGET"
 
 canonical_path() {
   target="$1"
