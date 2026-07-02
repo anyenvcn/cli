@@ -438,7 +438,7 @@ anyenv stop
 - `anyenv start` 只使用账号级 `local_client:write` 权限；项目 Token 只用于项目同步/MCP，不用于本地设备在线。
 - `--workspace` / `--dir` 是本地目录 allowlist；网页不会自动扫描磁盘，WebSocket 心跳也不能扩大这个 allowlist。
 - 默认不开放云端任意命令执行；只有显式带 `--allow-local-commands` 在线时，网页、手机或 IM 才能在 `--command-root` 范围内请求本机命令。
-- 远程执行必须具备权限、审计、超时和可撤销边界；远程桌面只需要显式带 `--allow-remote-desktop` 并先在本机开启 VNC 或系统屏幕共享。默认 `--vnc-port auto` 会在本机探测真实 VNC/RFB 源端口；`--vnc-port <port>` 只是本机 VNC 源端口的可选覆盖。浏览器始终通过 AnyEnv WebSocket 中继连接，不要求本机暴露公网端口或登记额外目录。
+- 远程执行必须具备权限、审计、超时和可撤销边界；远程桌面只需要显式带 `--allow-remote-desktop`。默认 `--vnc-port auto` 会启动 CLI 内置远程桌面 helper 并监听随机 localhost 端口；`--vnc-port <port>` 是接入已有 VNC Server 的高级兼容模式。浏览器始终通过 AnyEnv WebSocket 中继连接，不要求本机暴露公网端口或登记额外目录。
 
 ## MCP
 

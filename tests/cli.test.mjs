@@ -3104,6 +3104,7 @@ test("start foreground auto-detects a local VNC port that speaks RFB", async () 
         ANYENV_CONFIG: config,
         ANYENV_PROJECT_ID: "",
         ANYENV_PROJECT_TOKEN: "",
+        ANYENV_REMOTE_DESKTOP_HELPER: "external",
         ANYENV_VNC_PORT_CANDIDATES: `${badPort},${vncPort}`,
         ANYENV_VNC_AUTO_HANDSHAKE_TIMEOUT_MS: "150",
         PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
@@ -3132,6 +3133,219 @@ test("start foreground auto-detects a local VNC port that speaks RFB", async () 
     await new Promise((resolve) => server.close(resolve));
     await new Promise((resolve) => tcpServer.close(resolve));
     await new Promise((resolve) => badServer.close(resolve));
+  }
+});
+
+test("start foreground starts an embedded VNC desktop when no system VNC is installed", async () => {
+  const { WebSocketServer } = await import("ws");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "anyenv-cli-vnc-embedded-"));
+  const config = path.join(dir, "config.json");
+  fs.writeFileSync(config, JSON.stringify({
+    apiBase: "http://127.0.0.1:1/api/v1",
+    globalToken: "evls_gt_vnc_embedded_token",
+    clientId: "lc_vnc_embedded",
+    deviceId: "ld_vnc_embedded",
+  }));
+
+  let registerBody = null;
+  let openResponse = null;
+  let rfbReady = false;
+  let framebufferReady = false;
+  let rfbBuffer = Buffer.alloc(0);
+  let rfbStage = "server-version";
+  let framebufferBytesExpected = 0;
+  let framebufferHeader = null;
+  const sendVncData = (ws, bytes) => ws.send(JSON.stringify({
+    type: "vnc.data",
+    requestId: "lvnc-cli-embedded",
+    data: Buffer.from(bytes).toString("base64"),
+  }));
+  const processRfb = (ws) => {
+    while (rfbBuffer.length) {
+      if (rfbStage === "server-version") {
+        if (rfbBuffer.length < 12) return;
+        assert.equal(rfbBuffer.subarray(0, 12).toString("ascii"), "RFB 003.008\n");
+        rfbBuffer = rfbBuffer.subarray(12);
+        sendVncData(ws, Buffer.from("RFB 003.008\n", "ascii"));
+        rfbStage = "security-types";
+        continue;
+      }
+      if (rfbStage === "security-types") {
+        if (rfbBuffer.length < 2) return;
+        assert.equal(rfbBuffer[0], 1);
+        assert.equal(rfbBuffer[1], 1);
+        rfbBuffer = rfbBuffer.subarray(2);
+        sendVncData(ws, Buffer.from([1]));
+        rfbStage = "security-result";
+        continue;
+      }
+      if (rfbStage === "security-result") {
+        if (rfbBuffer.length < 4) return;
+        assert.equal(rfbBuffer.readUInt32BE(0), 0);
+        rfbBuffer = rfbBuffer.subarray(4);
+        sendVncData(ws, Buffer.from([1]));
+        rfbStage = "server-init";
+        continue;
+      }
+      if (rfbStage === "server-init") {
+        if (rfbBuffer.length < 24) return;
+        const width = rfbBuffer.readUInt16BE(0);
+        const height = rfbBuffer.readUInt16BE(2);
+        const nameLength = rfbBuffer.readUInt32BE(20);
+        if (rfbBuffer.length < 24 + nameLength) return;
+        const name = rfbBuffer.subarray(24, 24 + nameLength).toString("utf8");
+        assert.equal(width, 800);
+        assert.equal(height, 500);
+        assert.match(name, /AnyEnv CLI Embedded Desktop/);
+        rfbBuffer = rfbBuffer.subarray(24 + nameLength);
+        rfbReady = true;
+        const updateRequest = Buffer.alloc(10);
+        updateRequest[0] = 3;
+        updateRequest[1] = 0;
+        updateRequest.writeUInt16BE(0, 2);
+        updateRequest.writeUInt16BE(0, 4);
+        updateRequest.writeUInt16BE(width, 6);
+        updateRequest.writeUInt16BE(height, 8);
+        sendVncData(ws, updateRequest);
+        rfbStage = "framebuffer-update";
+        continue;
+      }
+      if (rfbStage === "framebuffer-update") {
+        if (!framebufferHeader) {
+          if (rfbBuffer.length < 16) return;
+          assert.equal(rfbBuffer[0], 0);
+          assert.equal(rfbBuffer.readUInt16BE(2), 1);
+          const rectWidth = rfbBuffer.readUInt16BE(8);
+          const rectHeight = rfbBuffer.readUInt16BE(10);
+          assert.equal(rfbBuffer.readInt32BE(12), 0);
+          framebufferBytesExpected = rectWidth * rectHeight * 4;
+          framebufferHeader = true;
+          rfbBuffer = rfbBuffer.subarray(16);
+        }
+        if (rfbBuffer.length < framebufferBytesExpected) return;
+        const firstBytes = rfbBuffer.subarray(0, 32);
+        assert.ok(firstBytes.some((byte) => byte !== 0));
+        rfbBuffer = rfbBuffer.subarray(framebufferBytesExpected);
+        framebufferReady = true;
+        const keyEvent = Buffer.alloc(8);
+        keyEvent[0] = 4;
+        keyEvent[1] = 1;
+        keyEvent.writeUInt32BE("A".charCodeAt(0), 4);
+        sendVncData(ws, keyEvent);
+        ws.send(JSON.stringify({ type: "vnc.close", requestId: "lvnc-cli-embedded", reason: "test_done" }));
+        ws.close(1000);
+        return;
+      }
+      return;
+    }
+  };
+
+  const server = http.createServer((req, res) => {
+    let raw = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      const body = raw ? JSON.parse(raw) : null;
+      if (req.url === "/api/v1/cli/local-clients/register") {
+        registerBody = body;
+        res.writeHead(201, { "Content-Type": "application/json", "Connection": "close" });
+        res.end(JSON.stringify({
+          id: "aloc-vnc-embedded",
+          clientId: body.clientId,
+          deviceId: body.deviceId,
+          name: body.name,
+          status: "online",
+          capabilities: body.capabilities,
+          metadata: body.metadata,
+          workspaces: body.workspaces,
+        }));
+        return;
+      }
+      res.writeHead(404, { "Content-Type": "application/json", "Connection": "close" });
+      res.end(JSON.stringify({ detail: `unexpected ${req.method} ${req.url}` }));
+    });
+  });
+  const wss = new WebSocketServer({ noServer: true });
+  server.on("upgrade", (req, socket, head) => {
+    if (req.url !== "/ws/local-devices") {
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  });
+  wss.on("connection", (ws) => {
+    ws.on("message", (data) => {
+      const message = JSON.parse(String(data));
+      if (message.type === "auth") {
+        ws.send(JSON.stringify({
+          type: "ready",
+          scope: "account",
+          projectId: "",
+          clientId: message.clientId,
+          deviceId: message.deviceId,
+        }));
+        setTimeout(() => {
+          ws.send(JSON.stringify({
+            type: "vnc.open.request",
+            requestId: "lvnc-cli-embedded",
+          }));
+        }, 50);
+        return;
+      }
+      if (message.type === "vnc.open.response") {
+        openResponse = message;
+        return;
+      }
+      if (message.type === "vnc.data") {
+        rfbBuffer = Buffer.concat([rfbBuffer, Buffer.from(message.data, "base64")]);
+        processRfb(ws);
+      }
+    });
+  });
+
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  let child = null;
+  try {
+    const { port } = server.address();
+    child = spawn(process.execPath, [
+      bin,
+      "start",
+      "--foreground",
+      "--json",
+      "--api",
+      `http://127.0.0.1:${port}/api/v1`,
+      "--allow-remote-desktop",
+    ], {
+      cwd: root,
+      env: {
+        ...process.env,
+        ANYENV_CONFIG: config,
+        ANYENV_PROJECT_ID: "",
+        ANYENV_PROJECT_TOKEN: "",
+        ANYENV_VNC_PORT_CANDIDATES: "5997,5998",
+        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stderr.resume();
+    child.stdout.resume();
+    await waitFor(() => openResponse && rfbReady && framebufferReady, 10000);
+    assert.equal(registerBody.metadata.remoteDesktop.mode, "cli-managed-rfb");
+    assert.equal(registerBody.metadata.remoteDesktop.source, "cli-embedded");
+    assert.equal(registerBody.metadata.remoteDesktop.portMode, "auto");
+    assert.equal(openResponse.ok, true);
+    assert.equal(openResponse.remoteDesktop.mode, "cli-managed-rfb");
+    assert.equal(openResponse.remoteDesktop.source, "cli-embedded");
+    assert.equal(openResponse.remoteDesktop.portMode, "auto");
+    assert.ok(openResponse.resolvedPort > 0);
+    assert.ok(![5997, 5998].includes(openResponse.resolvedPort));
+  } finally {
+    if (child && !child.killed) {
+      child.kill("SIGTERM");
+      await new Promise((resolve) => child.once("close", resolve));
+    }
+    wss.close();
+    await new Promise((resolve) => server.close(resolve));
   }
 });
 

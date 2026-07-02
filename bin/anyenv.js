@@ -1457,7 +1457,7 @@ function displayVncPort(value) {
 
 function describeVncSource(value) {
   const port = displayVncPort(value);
-  return port === "auto" ? "127.0.0.1:auto (RFB auto-detect)" : `127.0.0.1:${port}`;
+  return port === "auto" ? "127.0.0.1:auto (CLI managed desktop)" : `127.0.0.1:${port}`;
 }
 
 async function registerAccountLocalClientWithWorkspaces(config, workspaces, args = {}) {
@@ -2279,7 +2279,7 @@ async function cmdStart(args) {
     }
     if (result.payload.metadata?.remoteDesktop?.enabled) {
       const rd = result.payload.metadata.remoteDesktop;
-      process.stdout.write(`Remote desktop: enabled (AnyEnv WebSocket relay, local VNC source ${rd.portMode === "auto" ? "127.0.0.1:auto (RFB auto-detect)" : `127.0.0.1:${rd.port || 5900}`})\n`);
+      process.stdout.write(`Remote desktop: enabled (AnyEnv WebSocket relay, local desktop source ${rd.portMode === "auto" ? "127.0.0.1:auto (CLI managed desktop)" : `127.0.0.1:${rd.port || 5900}`})\n`);
     }
     if (!args.once) process.stdout.write("Connection is active. Press Ctrl+C to stop.\n");
     return;
@@ -2320,6 +2320,7 @@ async function cmdStart(args) {
         host: "127.0.0.1",
         port: displayVncPort(commandOptions.vncPort),
         portMode: displayVncPort(commandOptions.vncPort) === "auto" ? "auto" : "fixed",
+        source: displayVncPort(commandOptions.vncPort) === "auto" ? "cli-embedded" : "external-vnc",
       },
     };
     if (args.json) printJson(payload);
@@ -2381,7 +2382,7 @@ async function cmdStart(args) {
     process.stdout.write(`Local commands: enabled (root: ${commandOptions.commandRoot || process.cwd()})\n`);
   }
   if (commandOptions.allowRemoteDesktop) {
-    process.stdout.write(`Remote desktop: enabled (AnyEnv WebSocket relay, local VNC source ${describeVncSource(commandOptions.vncPort)})\n`);
+    process.stdout.write(`Remote desktop: enabled (AnyEnv WebSocket relay, local desktop source ${describeVncSource(commandOptions.vncPort)})\n`);
   }
   process.stdout.write("Use anyenv status, anyenv stop, or anyenv restart to manage it.\n");
 }
