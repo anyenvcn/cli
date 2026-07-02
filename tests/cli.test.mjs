@@ -2983,6 +2983,158 @@ test("start foreground bridges local VNC bytes when remote desktop is explicitly
   }
 });
 
+test("start foreground auto-detects a local VNC port that speaks RFB", async () => {
+  const { WebSocketServer } = await import("ws");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "anyenv-cli-vnc-auto-"));
+  const config = path.join(dir, "config.json");
+  fs.writeFileSync(config, JSON.stringify({
+    apiBase: "http://127.0.0.1:1/api/v1",
+    globalToken: "evls_gt_vnc_auto_token",
+    clientId: "lc_vnc_auto",
+    deviceId: "ld_vnc_auto",
+  }));
+
+  let badSocket = null;
+  const badServer = net.createServer((socket) => {
+    badSocket = socket;
+  });
+  await new Promise((resolve) => badServer.listen(0, "127.0.0.1", resolve));
+  const badPort = badServer.address().port;
+
+  let tcpSocket = null;
+  let tcpReceived = "";
+  const tcpServer = net.createServer((socket) => {
+    tcpSocket = socket;
+    socket.write(Buffer.from("RFB 003.008\n", "utf8"));
+    socket.on("data", (chunk) => {
+      tcpReceived += chunk.toString("utf8");
+    });
+  });
+  await new Promise((resolve) => tcpServer.listen(0, "127.0.0.1", resolve));
+  const vncPort = tcpServer.address().port;
+
+  let registerBody = null;
+  let openResponse = null;
+  let vncBannerFrame = null;
+  const server = http.createServer((req, res) => {
+    let raw = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      const body = raw ? JSON.parse(raw) : null;
+      if (req.url === "/api/v1/cli/local-clients/register") {
+        registerBody = body;
+        res.writeHead(201, { "Content-Type": "application/json", "Connection": "close" });
+        res.end(JSON.stringify({
+          id: "aloc-vnc-auto",
+          clientId: body.clientId,
+          deviceId: body.deviceId,
+          name: body.name,
+          status: "online",
+          capabilities: body.capabilities,
+          metadata: body.metadata,
+          workspaces: body.workspaces,
+        }));
+        return;
+      }
+      res.writeHead(404, { "Content-Type": "application/json", "Connection": "close" });
+      res.end(JSON.stringify({ detail: `unexpected ${req.method} ${req.url}` }));
+    });
+  });
+  const wss = new WebSocketServer({ noServer: true });
+  server.on("upgrade", (req, socket, head) => {
+    if (req.url !== "/ws/local-devices") {
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  });
+  wss.on("connection", (ws) => {
+    ws.on("message", (data) => {
+      const message = JSON.parse(String(data));
+      if (message.type === "auth") {
+        ws.send(JSON.stringify({
+          type: "ready",
+          scope: "account",
+          projectId: "",
+          clientId: message.clientId,
+          deviceId: message.deviceId,
+        }));
+        setTimeout(() => {
+          ws.send(JSON.stringify({
+            type: "vnc.open.request",
+            requestId: "lvnc-cli-auto",
+          }));
+        }, 50);
+        return;
+      }
+      if (message.type === "vnc.open.response") {
+        openResponse = message;
+        ws.send(JSON.stringify({
+          type: "vnc.data",
+          requestId: "lvnc-cli-auto",
+          data: Buffer.from("browser-to-auto-vnc", "utf8").toString("base64"),
+        }));
+        return;
+      }
+      if (message.type === "vnc.data") {
+        vncBannerFrame = message;
+        ws.send(JSON.stringify({ type: "vnc.close", requestId: "lvnc-cli-auto", reason: "test_done" }));
+        ws.close(1000);
+      }
+    });
+  });
+
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  let child = null;
+  try {
+    const { port } = server.address();
+    child = spawn(process.execPath, [
+      bin,
+      "start",
+      "--foreground",
+      "--json",
+      "--api",
+      `http://127.0.0.1:${port}/api/v1`,
+      "--allow-remote-desktop",
+    ], {
+      cwd: root,
+      env: {
+        ...process.env,
+        ANYENV_CONFIG: config,
+        ANYENV_PROJECT_ID: "",
+        ANYENV_PROJECT_TOKEN: "",
+        ANYENV_VNC_PORT_CANDIDATES: `${badPort},${vncPort}`,
+        ANYENV_VNC_AUTO_HANDSHAKE_TIMEOUT_MS: "150",
+        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stderr.resume();
+    child.stdout.resume();
+    await waitFor(() => openResponse && vncBannerFrame && tcpReceived.includes("browser-to-auto-vnc"), 10000);
+    assert.equal(registerBody.metadata.remoteDesktop.portMode, "auto");
+    assert.deepEqual(registerBody.metadata.remoteDesktop.candidatePorts, [badPort, vncPort]);
+    assert.equal(openResponse.ok, true);
+    assert.equal(openResponse.port, vncPort);
+    assert.equal(openResponse.resolvedPort, vncPort);
+    assert.equal(openResponse.remoteDesktop.port, vncPort);
+    assert.equal(openResponse.remoteDesktop.portMode, "auto");
+    assert.equal(Buffer.from(vncBannerFrame.data, "base64").toString("utf8"), "RFB 003.008\n");
+  } finally {
+    if (badSocket) badSocket.destroy();
+    if (tcpSocket) tcpSocket.destroy();
+    if (child && !child.killed) {
+      child.kill("SIGTERM");
+      await new Promise((resolve) => child.once("close", resolve));
+    }
+    wss.close();
+    await new Promise((resolve) => server.close(resolve));
+    await new Promise((resolve) => tcpServer.close(resolve));
+    await new Promise((resolve) => badServer.close(resolve));
+  }
+});
+
 test("start foreground rejects a local remote desktop port that never speaks RFB", async () => {
   const { WebSocketServer } = await import("ws");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "anyenv-cli-vnc-timeout-"));
