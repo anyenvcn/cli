@@ -2983,6 +2983,127 @@ test("start foreground bridges local VNC bytes when remote desktop is explicitly
   }
 });
 
+test("start foreground rejects a local remote desktop port that never speaks RFB", async () => {
+  const { WebSocketServer } = await import("ws");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "anyenv-cli-vnc-timeout-"));
+  const config = path.join(dir, "config.json");
+  fs.writeFileSync(config, JSON.stringify({
+    apiBase: "http://127.0.0.1:1/api/v1",
+    globalToken: "evls_gt_vnc_timeout_token",
+    clientId: "lc_vnc_timeout",
+    deviceId: "ld_vnc_timeout",
+  }));
+
+  let tcpSocket = null;
+  const tcpServer = net.createServer((socket) => {
+    tcpSocket = socket;
+  });
+  await new Promise((resolve) => tcpServer.listen(0, "127.0.0.1", resolve));
+  const vncPort = tcpServer.address().port;
+
+  let openResponse = null;
+  const server = http.createServer((req, res) => {
+    let raw = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      const body = raw ? JSON.parse(raw) : null;
+      if (req.url === "/api/v1/cli/local-clients/register") {
+        res.writeHead(201, { "Content-Type": "application/json", "Connection": "close" });
+        res.end(JSON.stringify({
+          id: "aloc-vnc-timeout",
+          clientId: body.clientId,
+          deviceId: body.deviceId,
+          name: body.name,
+          status: "online",
+          capabilities: body.capabilities,
+          metadata: body.metadata,
+          workspaces: body.workspaces,
+        }));
+        return;
+      }
+      res.writeHead(404, { "Content-Type": "application/json", "Connection": "close" });
+      res.end(JSON.stringify({ detail: `unexpected ${req.method} ${req.url}` }));
+    });
+  });
+  const wss = new WebSocketServer({ noServer: true });
+  server.on("upgrade", (req, socket, head) => {
+    if (req.url !== "/ws/local-devices") {
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  });
+  wss.on("connection", (ws) => {
+    ws.on("message", (data) => {
+      const message = JSON.parse(String(data));
+      if (message.type === "auth") {
+        ws.send(JSON.stringify({
+          type: "ready",
+          scope: "account",
+          projectId: "",
+          clientId: message.clientId,
+          deviceId: message.deviceId,
+        }));
+        setTimeout(() => {
+          ws.send(JSON.stringify({
+            type: "vnc.open.request",
+            requestId: "lvnc-cli-timeout",
+          }));
+        }, 50);
+        return;
+      }
+      if (message.type === "vnc.open.response") {
+        openResponse = message;
+        ws.close(1000);
+      }
+    });
+  });
+
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  let child = null;
+  try {
+    const { port } = server.address();
+    child = spawn(process.execPath, [
+      bin,
+      "start",
+      "--foreground",
+      "--json",
+      "--api",
+      `http://127.0.0.1:${port}/api/v1`,
+      "--allow-remote-desktop",
+      "--vnc-port",
+      String(vncPort),
+    ], {
+      cwd: root,
+      env: {
+        ...process.env,
+        ANYENV_CONFIG: config,
+        ANYENV_PROJECT_ID: "",
+        ANYENV_PROJECT_TOKEN: "",
+        ANYENV_VNC_HANDSHAKE_TIMEOUT_MS: "200",
+        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stderr.resume();
+    child.stdout.resume();
+    await waitFor(() => openResponse, 10000);
+    assert.equal(openResponse.ok, false);
+    assert.equal(openResponse.code, "vnc_handshake_timeout");
+    assert.match(openResponse.error, /VNC\/RFB/);
+  } finally {
+    if (tcpSocket) tcpSocket.destroy();
+    if (child && !child.killed) {
+      child.kill("SIGTERM");
+      await new Promise((resolve) => child.once("close", resolve));
+    }
+    wss.close();
+    await new Promise((resolve) => server.close(resolve));
+    await new Promise((resolve) => tcpServer.close(resolve));
+  }
+});
+
 test("start background fails fast when the daemon exits during websocket auth", async () => {
   const { WebSocketServer } = await import("ws");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "anyenv-cli-test-"));
